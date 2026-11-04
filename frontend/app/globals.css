@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-plex), system-ui, sans-serif;
+  --color-bg: #11151b;
+  --color-panel: #171c24;
+  --color-raise: #1f2630;
+  --color-line: #2a313c;
+  --color-ink: #e3e7ee;
+  --color-dim: #8b94a5;
+  --color-up: #3cb98f;
+  --color-down: #e5675a;
+  --color-hold: #d6a64a;
+  --color-focus: #7fa7e0;
+}
+
+:root { color-scheme: dark; }
+* { scrollbar-width: thin; scrollbar-color: var(--color-line) transparent; }
+body {
+  background: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+}
+:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+
+/* Dipakai WishlistBubbles */
+@keyframes float { 0%,100% { transform: translateY(0) rotate(0); } 50% { transform: translateY(-12px) rotate(1.5deg); } }
+@keyframes fadeIn { from { opacity: 0; transform: scale(.98); } to { opacity: 1; transform: scale(1); } }
+@keyframes fadeOut { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(.98); } }
+.animate-float { animation: float 4s ease-in-out infinite; }
+.animate-fade-in { animation: fadeIn .4s ease-out forwards; }
+.animate-fade-out { animation: fadeOut .3s ease-in forwards; }
+@media (prefers-reduced-motion: reduce) {
+  .animate-float, .animate-fade-in, .animate-fade-out { animation: none; }
+}
