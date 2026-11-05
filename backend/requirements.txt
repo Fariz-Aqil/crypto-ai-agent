@@ -1,7 +1,6 @@
 fastapi
 uvicorn
-google-generativeai
-pandas
-pandas-ta
+numpy
 requests
 python-dotenv
+google-genai
