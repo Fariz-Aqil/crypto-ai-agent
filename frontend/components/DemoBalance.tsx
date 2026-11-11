@@ -4,10 +4,14 @@ import { useEffect, useRef, useState } from "react";
 import type { Candle } from "./AiAnalysisPanel";
 import { num } from "./AiAnalysisPanel";
 
-const API = "http://127.0.0.1:8000";
+const API = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 const KEY = "quantum_demo_account_v2";
 const START = 10000;
 const FEE = 0.001; // biaya 0,1% per sisi, seperti spot Binance
+const MIN_HOLD = 30 * 60; // detik: sinyal balik tidak boleh menutup posisi AI lebih cepat dari ini
+const REVERSE_CONF = 70; // keyakinan minimal AI untuk membalik arah
+const MAX_AI_POS = 2; // maksimal posisi AI yang terbuka bersamaan
+const MIN_CASH_FRAC = 0.2; // tidak buka posisi baru kalau saldo tunai di bawah 20% ekuitas
 
 type Side = "LONG" | "SHORT";
 type Src = "AI" | "Manual";
@@ -47,7 +51,7 @@ function close(a: Acct, id: string, exit: number, reason: string): Acct {
 function sizeFor(a: Acct, px: number, sl: number) {
   const eq = equityOf(a);
   const byRisk = (eq * a.riskPct) / 100 / Math.abs(px - sl);
-  return Math.max(0, Math.min(byRisk, (eq * 0.5) / px, (a.cash * 0.98) / px));
+  return Math.max(0, Math.min(byRisk, (eq * 0.4) / px, (a.cash * 0.98) / px));
 }
 
 // Cek candle sejak posisi dibuka. Kalau SL dan TP kena di candle yang sama, SL dianggap lebih dulu.
@@ -91,8 +95,8 @@ function Curve({ data }: { data: { e: number }[] }) {
   );
 }
 
-export default function DemoBalance({ symbol, price, signal, onRefreshAnalysis }: {
-  symbol: string; price?: number; signal: Signal; onRefreshAnalysis: () => void;
+export default function DemoBalance({ symbol, price, signal, score, onRefreshAnalysis }: {
+  symbol: string; price?: number; signal: Signal; score?: number; onRefreshAnalysis: () => void;
 }) {
   const [a, setA] = useState<Acct>(fresh);
   const [loaded, setLoaded] = useState(false);
@@ -102,6 +106,7 @@ export default function DemoBalance({ symbol, price, signal, onRefreshAnalysis }
   const [tpPct, setTpPct] = useState("3");
   const ref = useRef(a); ref.current = a;
   const priceRef = useRef(price); priceRef.current = price;
+  const scoreRef = useRef(score); scoreRef.current = score;
   const refreshRef = useRef(onRefreshAnalysis); refreshRef.current = onRefreshAnalysis;
   const idr = symbol.includes("IDR");
 
@@ -152,17 +157,25 @@ export default function DemoBalance({ symbol, price, signal, onRefreshAnalysis }
     if (!loaded || !a.auto || !signal || idr) return;
     const px = priceRef.current;
     if (!px) return;
+    const score = scoreRef.current ?? 0; // skor konfluensi indikator, -1 sampai 1
     setA((prev) => {
       if (!prev.auto || signal.action === "HOLD") return prev;
       const want: Side = signal.action === "BUY" ? "LONG" : "SHORT";
+      const dir = want === "LONG" ? 1 : -1;
       const key = `${signal.action}|${signal.sl}|${signal.tp}`;
       let n = prev;
       const cur = prev.pos.find((p) => p.symbol === signal.symbol);
       if (cur) {
         if (cur.source !== "AI" || cur.side === want) return prev;
+        // Membalik arah hanya kalau AI yakin, indikator setuju, dan posisi sudah cukup lama
+        const held = Date.now() / 1000 - cur.openedAt;
+        if (held < MIN_HOLD || signal.confidence < REVERSE_CONF || dir * score < 0.4) return prev;
         n = close(n, cur.id, px, "Sinyal balik");
       }
       if (prev.seen[signal.symbol] === key || signal.confidence < prev.minConf) return n;
+      if (dir * score < 0) return n; // indikator berlawanan dengan AI
+      if (n.pos.filter((p) => p.source === "AI").length >= MAX_AI_POS) return n;
+      if (n.cash < MIN_CASH_FRAC * equityOf(n)) return n;
       const valid = signal.sl > 0 && signal.tp > 0 && (want === "LONG" ? signal.sl < px && px < signal.tp : signal.tp < px && px < signal.sl);
       if (!valid) return n;
       const opened = open(n, { symbol: signal.symbol, side: want, qty: sizeFor(n, px, signal.sl), entry: px, sl: signal.sl, tp: signal.tp, source: "AI" });
@@ -195,6 +208,116 @@ export default function DemoBalance({ symbol, price, signal, onRefreshAnalysis }
   if (!loaded) return null;
 
   const px = (p: Pos) => (p.symbol === symbol && price ? price : p.last ?? p.entry);
+  const equity = a.cash + a.pos.reduce((s, p) => s + margin(p) + pnlOf(p, px(p)), 0);
+  const total = equity - START, totalPct = (total / START) * 100;
+  const list = a.trades.filter((t) => who === "all" || t.source === who);
+  const st = stats(list);
+  const hasPos = a.pos.some((p) => p.symbol === symbol);
+  const orderOff = !price || idr || hasPos;
+  const field = "w-14 border border-line bg-bg px-1.5 py-0.5 text-right focus:border-focus focus:outline-none";
+  const Stat = ({ k, v, c = "" }: { k: string; v: string; c?: string }) => (
+    <div><p className="text-xs text-dim">{k}</p><p className={`text-lg font-medium ${c}`}>{v}</p></div>
+  );
+  const th = "py-1.5 pr-4 text-left font-normal text-dim";
+  const td = "py-1.5 pr-4 whitespace-nowrap";
+
+  return (
+    <section className="border-t border-line" aria-label="Demo trading">
+      <div className="flex flex-wrap items-end gap-x-8 gap-y-3 px-4 py-3">
+        <Stat k="Saldo tunai" v={usd(a.cash)} />
+        <Stat k="Ekuitas" v={usd(equity)} />
+        <Stat k="Laba rugi total" v={`${usd(total)} (${total >= 0 ? "+" : "−"}${Math.abs(totalPct).toFixed(2)}%)`} c={cls(total)} />
+        <div className="ml-auto flex flex-wrap items-center gap-x-5 gap-y-2 text-xs">
+          <label className="flex items-center gap-2">
+            <button role="switch" aria-checked={a.auto} onClick={() => setA((p) => ({ ...p, auto: !p.auto }))}
+              className={`relative h-5 w-9 border ${a.auto ? "border-up bg-up/20" : "border-line bg-raise"}`}>
+              <span className={`absolute top-0.5 h-3.5 w-3.5 ${a.auto ? "left-[18px] bg-up" : "left-0.5 bg-dim"}`} />
+            </button>
+            <span className={a.auto ? "text-ink" : "text-dim"}>AI trading otomatis</span>
+          </label>
+          <label className="flex items-center gap-1.5 text-dim">Risiko %
+            <input key={`r${a.riskPct}`} defaultValue={a.riskPct} inputMode="decimal" className={field}
+              onBlur={(e) => setA((p) => ({ ...p, riskPct: Math.min(10, Math.max(0.1, +e.target.value || p.riskPct)) }))} /></label>
+          <label className="flex items-center gap-1.5 text-dim">Keyakinan min. %
+            <input key={`c${a.minConf}`} defaultValue={a.minConf} inputMode="numeric" className={field}
+              onBlur={(e) => setA((p) => ({ ...p, minConf: Math.min(100, Math.max(0, +e.target.value || p.minConf)) }))} /></label>
+          <button onClick={reset} className="text-dim hover:text-down">Reset</button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-line px-4 py-2 text-xs">
+        <span className="text-dim">Order manual {symbol}</span>
+        <label className="flex items-center gap-1.5 text-dim">SL %<input value={slPct} onChange={(e) => setSlPct(e.target.value)} inputMode="decimal" className={field} /></label>
+        <label className="flex items-center gap-1.5 text-dim">TP %<input value={tpPct} onChange={(e) => setTpPct(e.target.value)} inputMode="decimal" className={field} /></label>
+        <button onClick={() => order("LONG")} disabled={orderOff} className="border border-up px-3 py-1 text-up hover:bg-up/10 disabled:opacity-40">Beli (long)</button>
+        <button onClick={() => order("SHORT")} disabled={orderOff} className="border border-down px-3 py-1 text-down hover:bg-down/10 disabled:opacity-40">Jual (short)</button>
+        {idr && <span className="text-dim">Demo belum mendukung pasangan IDR.</span>}
+        {hasPos && <span className="text-dim">Sudah ada posisi di aset ini.</span>}
+      </div>
+
+      <div role="group" aria-label="Tab demo" className="flex gap-4 border-t border-line px-4 pt-2 text-sm">
+        {([["pos", `Posisi (${a.pos.length})`], ["hist", `Riwayat (${a.trades.length})`], ["perf", "Performa"]] as const).map(([k, l]) => (
+          <button key={k} onClick={() => setTab(k)} aria-pressed={tab === k}
+            className={`border-b-2 pb-1.5 ${tab === k ? "border-ink text-ink" : "border-transparent text-dim hover:text-ink"}`}>{l}</button>
+        ))}
+      </div>
+
+      <div className="max-h-64 overflow-auto px-4 pb-4 text-xs">
+        {tab === "pos" && (a.pos.length === 0 ? (
+          <p className="py-4 text-dim">Tidak ada posisi terbuka. Nyalakan AI otomatis atau buka order manual. SL dan TP dipantau terus selama halaman terbuka.</p>
+        ) : (
+          <table className="w-full"><thead><tr>{["Aset", "Arah", "Jumlah", "Masuk", "Sekarang", "SL", "TP", "Laba rugi", "Sumber", ""].map((h) => <th key={h} className={th}>{h}</th>)}</tr></thead>
+            <tbody>{a.pos.map((p) => { const v = pnlOf(p, px(p)); return (
+              <tr key={p.id} className="border-t border-line">
+                <td className={td}>{p.symbol}</td>
+                <td className={`${td} ${p.side === "LONG" ? "text-up" : "text-down"}`}>{p.side === "LONG" ? "Long" : "Short"}</td>
+                <td className={td}>{num(p.qty)}</td><td className={td}>{num(p.entry)}</td><td className={td}>{num(px(p))}</td>
+                <td className={td}>{p.sl ? num(p.sl) : "-"}</td><td className={td}>{p.tp ? num(p.tp) : "-"}</td>
+                <td className={`${td} ${cls(v)}`}>{usd(v)}</td><td className={td}>{p.source}</td>
+                <td className={td}><button onClick={() => setA((prev) => close(prev, p.id, px(p), "Ditutup manual"))} className="text-dim underline hover:text-ink">Tutup</button></td>
+              </tr>); })}</tbody></table>
+        ))}
+
+        {tab === "hist" && (a.trades.length === 0 ? <p className="py-4 text-dim">Belum ada transaksi selesai.</p> : (
+          <table className="w-full"><thead><tr>{["Ditutup", "Aset", "Alasan", "Arah", "Masuk", "Keluar", "Laba rugi", "Sumber"].map((h) => <th key={h} className={th}>{h}</th>)}</tr></thead>
+            <tbody>{a.trades.map((t) => (
+              <tr key={t.id} className="border-t border-line">
+                <td className={td}>{when(t.closedAt)}</td><td className={td}>{t.symbol}</td><td className={td}>{t.reason}</td>
+                <td className={`${td} ${t.side === "LONG" ? "text-up" : "text-down"}`}>{t.side === "LONG" ? "Long" : "Short"}</td>
+                <td className={td}>{num(t.entry)}</td><td className={td}>{num(t.exit)}</td>
+                <td className={`${td} ${cls(t.pnl)}`}>{usd(t.pnl)}</td><td className={td}>{t.source}</td>
+              </tr>))}</tbody></table>
+        ))}
+
+        {tab === "perf" && (
+          <div className="py-3">
+            <div className="mb-3 flex gap-4">
+              {(["AI", "Manual", "all"] as const).map((k) => (
+                <button key={k} onClick={() => setWho(k)} aria-pressed={who === k}
+                  className={`border-b pb-0.5 ${who === k ? "border-ink text-ink" : "border-transparent text-dim hover:text-ink"}`}>{k === "all" ? "Semua" : k}</button>
+              ))}
+            </div>
+            <dl className="grid grid-cols-2 gap-x-8 sm:grid-cols-4">
+              {([
+                ["Transaksi", String(st.n), ""], ["Win rate", st.n ? `${st.win.toFixed(1)}%` : "-", ""],
+                ["Laba rugi bersih", usd(st.net), cls(st.net)], ["Profit factor", st.n ? (isFinite(st.pf) ? st.pf.toFixed(2) : "∞") : "-", ""],
+                ["Rata-rata untung", usd(st.avgW), "text-up"], ["Rata-rata rugi", usd(-st.avgL), "text-down"],
+                ["Ekspektasi per trade", usd(st.exp), cls(st.exp)], ["Penurunan maks. akun", `${maxDrawdown(a.curve).toFixed(1)}%`, ""],
+              ] as const).map(([k, v, c]) => (
+                <div key={k} className="border-t border-line py-1.5"><dt className="text-dim">{k}</dt><dd className={`text-sm ${c}`}>{v}</dd></div>
+              ))}
+            </dl>
+            {st.n < 30 && <p className="mt-2 text-hold">Baru {st.n} transaksi. Angka di atas belum bisa dipakai untuk menilai akurasi, tunggu minimal 30 transaksi.</p>}
+            <p className="mb-1 mt-3 text-dim">Kurva ekuitas akun (garis putus-putus = modal awal)</p>
+            <Curve data={a.curve} />
+            <p className="mt-2 text-dim">Simulasi memakai harga pasar asli dengan biaya 0,1% per sisi. Tanpa slippage, jadi hasil nyata biasanya lebih buruk.</p>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
   const equity = a.cash + a.pos.reduce((s, p) => s + margin(p) + pnlOf(p, px(p)), 0);
   const total = equity - START, totalPct = (total / START) * 100;
   const list = a.trades.filter((t) => who === "all" || t.source === who);
