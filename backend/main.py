@@ -11,6 +11,8 @@ Variabel di file .env (semua opsional kecuali GEMINI_API_KEY kalau mau sinyal AI
   DEEPSEEK_MODEL        nama model DeepSeek (default deepseek-flash)
   DEEPSEEK_BASE_URL     default https://api.deepseek.com
   DEEPSEEK_THINKING     isi 1 untuk mode berpikir (lebih teliti tapi lebih lambat)
+  NEWS_SEARCH           isi 1 untuk memakai Gemini + Google Search untuk berita (bisa berbayar)
+                        bawaan: judul berita dari RSS media kripto, dinilai oleh Gemini (gratis)
 
 Pembagian peran AI:
   DeepSeek -> analisis teknikal dari angka indikator (tanpa akses internet)
@@ -22,6 +24,7 @@ import os
 import random
 import re
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -38,7 +41,7 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODELS = [
     m.strip()
-    for m in os.getenv("GEMINI_MODELS", "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-pro").split(",")
+    for m in os.getenv("GEMINI_MODELS", "gemini-3.6-flash,gemini-3.8-flash,gemini-3.5-flash-lite").split(",")
     if m.strip()
 ]
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -49,6 +52,7 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "0") == "1"
 NEWS_CACHE_SECONDS = 900
+NEWS_SEARCH = os.getenv("NEWS_SEARCH", "0") == "1"  # 1 = coba Google Search grounding lebih dulu (bisa berbayar)
 
 ANALYSIS_CACHE_SECONDS = 300
 KLINE_CACHE_SECONDS = 3
@@ -508,53 +512,125 @@ def _grounding_sources(resp) -> list:
     return out
 
 
-def _short_error(e: Exception) -> str:
+def _short_error(e: Exception, n: int = 140) -> str:
     msg = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "[kunci]", f"{type(e).__name__}: {e}")
-    return " ".join(msg.split())[:200]
+    return " ".join(msg.split())[:n]
 
 
-def call_gemini_news(sym: str):
-    """Berita dan sentimen terkini lewat Gemini dengan Google Search. Mengembalikan (data, pesan_error)."""
+def _parse_news(raw: dict, sources: list, method: str) -> dict:
+    sentiment = str(raw.get("sentiment", "NEUTRAL")).upper()
+    if sentiment not in ("BULLISH", "BEARISH", "NEUTRAL"):
+        sentiment = "NEUTRAL"
+    return {
+        "sentiment": sentiment,
+        "score": max(-1.0, min(1.0, float(raw.get("score", 0)))),
+        "confidence": max(0.0, min(100.0, float(raw.get("confidence", 0)))),
+        "risk_event": bool(raw.get("risk_event", False)),
+        "summary": str(raw.get("summary", ""))[:400],
+        "headlines": [
+            {"title": str(h.get("title", ""))[:120], "source": str(h.get("source", ""))[:40]}
+            for h in (raw.get("headlines") or [])[:4] if isinstance(h, dict)
+        ],
+        "sources": sources,
+        "method": method,
+    }
+
+
+NEWS_JSON_RULES = """Balas HANYA JSON valid tanpa markdown dengan kunci:
+{"sentiment": "BULLISH" atau "BEARISH" atau "NEUTRAL", "score": angka -1.0 sampai 1.0, "confidence": angka 0 sampai 100, "risk_event": true bila ada peristiwa besar dalam 24 jam yang bisa membuat harga bergejolak ekstrem (rapat The Fed, data inflasi, peretasan exchange, keputusan regulator), selain itu false, "summary": "maksimal 2 kalimat Bahasa Indonesia", "headlines": [{"title": "judul", "source": "nama media"}]}"""
+
+
+def _news_via_search(sym: str, label: str):
+    """Gemini + Google Search. Mengembalikan (data, error). Penggunaan grounding bisa berbayar."""
     if not client:
-        return None, "GEMINI_API_KEY belum dipasang atau salah"
-    label = asset_label(sym)
-    hit = _news_cache.get(label)
-    if hit and time.time() - hit[0] < NEWS_CACHE_SECONDS:
-        return hit[1], None
-    last_err = "Gemini tidak memberi jawaban"
+        return None, "GEMINI_API_KEY belum dipasang"
     kind = "forex dan komoditas" if sym in FOREX_SYMBOLS else "kripto"
-    prompt = f"""Hari ini {time.strftime('%Y-%m-%d')}. Gunakan pencarian Google untuk menemukan berita 48 jam terakhir tentang {label} dan kondisi pasar {kind} secara umum. Perhatikan juga peristiwa makro terjadwal (rapat The Fed, CPI, data tenaga kerja AS), regulasi, peretasan exchange, dan aliran dana ETF.
+    prompt = f"""Hari ini {time.strftime('%Y-%m-%d')}. Gunakan pencarian Google untuk menemukan berita 48 jam terakhir tentang {label} dan kondisi pasar {kind} secara umum. Perhatikan juga peristiwa makro terjadwal, regulasi, peretasan exchange, dan aliran dana ETF.
 Nilai sentimen berita untuk harga {label} dalam jangka pendek. Hanya berdasarkan hasil pencarian, jangan mengarang. Kalau tidak ada berita relevan, beri NEUTRAL dengan confidence rendah.
-Balas HANYA JSON valid tanpa markdown dengan kunci:
-{{"sentiment": "BULLISH" atau "BEARISH" atau "NEUTRAL", "score": angka -1.0 sampai 1.0, "confidence": angka 0 sampai 100, "risk_event": true bila ada peristiwa besar dalam 24 jam yang bisa membuat harga bergejolak ekstrem, selain itu false, "summary": "maksimal 2 kalimat Bahasa Indonesia", "headlines": [{{"title": "judul singkat", "source": "nama media"}}]}}"""
+{NEWS_JSON_RULES}"""
+    errs = []
     for model in GEMINI_MODELS:
         try:
             resp = client.models.generate_content(
                 model=model, contents=prompt,
                 config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
             )
-            raw = parse_json_text(resp.text)
-            sentiment = str(raw.get("sentiment", "NEUTRAL")).upper()
-            if sentiment not in ("BULLISH", "BEARISH", "NEUTRAL"):
-                sentiment = "NEUTRAL"
-            data = {
-                "sentiment": sentiment,
-                "score": max(-1.0, min(1.0, float(raw.get("score", 0)))),
-                "confidence": max(0.0, min(100.0, float(raw.get("confidence", 0)))),
-                "risk_event": bool(raw.get("risk_event", False)),
-                "summary": str(raw.get("summary", ""))[:400],
-                "headlines": [
-                    {"title": str(h.get("title", ""))[:120], "source": str(h.get("source", ""))[:40]}
-                    for h in (raw.get("headlines") or [])[:4] if isinstance(h, dict)
-                ],
-                "sources": _grounding_sources(resp),
-            }
+            return _parse_news(parse_json_text(resp.text), _grounding_sources(resp), "google_search"), None
+        except Exception as e:
+            errs.append(f"{model}: {_short_error(e)}")
+            print(f"Gemini berita (search) {model} gagal: {e}")
+    return None, "; ".join(errs)
+
+
+NEWS_FEEDS = {
+    "crypto": [("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+               ("Cointelegraph", "https://cointelegraph.com/rss"),
+               ("Decrypt", "https://decrypt.co/feed")],
+    "forex": [("FXStreet", "https://www.fxstreet.com/rss/news")],
+}
+
+
+def fetch_headlines(is_forex: bool, per_source: int = 8) -> list:
+    out = []
+    for name, url in NEWS_FEEDS["forex" if is_forex else "crypto"]:
+        try:
+            res = HTTP.get(url, timeout=5)
+            if res.status_code != 200:
+                continue
+            n = 0
+            for item in ET.fromstring(res.content).iter("item"):
+                title = " ".join((item.findtext("title") or "").split())
+                if title:
+                    out.append({"title": title[:140], "source": name})
+                    n += 1
+                if n >= per_source:
+                    break
+        except Exception as e:
+            print(f"RSS {name} gagal: {e}")
+    return out
+
+
+def _news_via_rss(sym: str, label: str):
+    """Judul berita dari RSS media, dinilai oleh Gemini tanpa alat pencarian (gratis)."""
+    if not client:
+        return None, "GEMINI_API_KEY belum dipasang"
+    heads = fetch_headlines(sym in FOREX_SYMBOLS)
+    if not heads:
+        return None, "feed berita RSS tidak bisa dijangkau dari server"
+    lines = "\n".join(f"{i + 1}. [{h['source']}] {h['title']}" for i, h in enumerate(heads))
+    prompt = f"""Hari ini {time.strftime('%Y-%m-%d')}. Berikut judul berita terbaru dari media keuangan:
+{lines}
+
+Nilai dampak berita-berita itu terhadap harga {label} dalam jangka pendek. Hanya gunakan daftar di atas dan jangan mengarang. Abaikan judul yang tidak berkaitan dengan {label} atau kondisi pasar secara umum. Kalau tidak ada yang relevan, beri NEUTRAL dengan confidence rendah. Untuk headlines, pilih maksimal 4 judul paling relevan dari daftar.
+{NEWS_JSON_RULES}"""
+    errs = []
+    for model in GEMINI_MODELS:
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            return _parse_news(parse_json_text(resp.text), [], "rss"), None
+        except Exception as e:
+            errs.append(f"{model}: {_short_error(e)}")
+            print(f"Gemini berita (rss) {model} gagal: {e}")
+    return None, "; ".join(errs)
+
+
+def call_gemini_news(sym: str):
+    """Berita dan sentimen. Mengembalikan (data, pesan_error)."""
+    label = asset_label(sym)
+    hit = _news_cache.get(label)
+    if hit and time.time() - hit[0] < NEWS_CACHE_SECONDS:
+        return hit[1], None
+    errors = []
+    for method, fn in ((("search", _news_via_search),) if NEWS_SEARCH else ()) + (("rss", _news_via_rss),):
+        data, err = fn(sym, label)
+        if data:
             _news_cache[label] = (time.time(), data)
             return data, None
-        except Exception as e:
-            last_err = f"{model}: {_short_error(e)}"
-            print(f"Gemini berita {model} gagal: {e}")
-    return None, last_err
+        errors.append(f"{method}: {err}")
+    return None, " | ".join(errors)[:600]
 
 
 def combine_signals(tech: dict, news, engine: str, news_err=None) -> dict:
