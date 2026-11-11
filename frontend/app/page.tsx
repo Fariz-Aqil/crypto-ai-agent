@@ -282,7 +282,7 @@ export default function Home() {
               </div>
             )}
           </div>
-          <DemoBalance symbol={symbol} price={price} signal={signal} onRefreshAnalysis={fetchAnalysis} />
+          <DemoBalance symbol={symbol} price={price} signal={signal} score={A?.score} onRefreshAnalysis={fetchAnalysis} />
         </main>
 
         <aside className="border-t border-line lg:overflow-y-auto lg:border-l lg:border-t-0">
@@ -303,6 +303,33 @@ export default function Home() {
                 </div>
                 <div className="mt-2 h-1 bg-raise"><div className="h-full bg-ink" style={{ width: `${Math.min(100, ai.confidence)}%` }} /></div>
                 <p className="mt-3 text-sm leading-relaxed text-dim">{ai.reasoning}</p>
+                {ai.components && (
+                  <div className="mt-3 border-t border-line pt-3 text-xs">
+                    <p className="flex justify-between">
+                      <span className="text-dim">Teknikal ({ai.components.technical.engine})</span>
+                      <span className={(ACTION[ai.components.technical.action] ?? ACTION.HOLD).c}>
+                        {(ACTION[ai.components.technical.action] ?? ACTION.HOLD).t} {ai.components.technical.confidence}%
+                      </span>
+                    </p>
+                    <p className="mt-1 flex justify-between">
+                      <span className="text-dim">Berita dan sentimen</span>
+                      {ai.components.news.available ? (
+                        <span className={ai.components.news.sentiment === "BULLISH" ? "text-up" : ai.components.news.sentiment === "BEARISH" ? "text-down" : "text-dim"}>
+                          {ai.components.news.sentiment === "BULLISH" ? "Positif" : ai.components.news.sentiment === "BEARISH" ? "Negatif" : "Netral"} ({Math.round(ai.components.news.confidence)}%)
+                        </span>
+                      ) : <span className="text-dim">tidak tersedia</span>}
+                    </p>
+                    {ai.components.news.available && ai.components.news.summary && <p className="mt-2 leading-relaxed text-dim">{ai.components.news.summary}</p>}
+                    {ai.components.adjustments?.map((n: string) => <p key={n} className="mt-1 text-hold">{n}</p>)}
+                    {ai.components.news.available && ai.components.news.sources?.length > 0 && (
+                      <p className="mt-2 text-dim">Sumber:{" "}
+                        {ai.components.news.sources.slice(0, 3).map((x: { title: string; uri: string }, i: number) => (
+                          <a key={x.uri} href={x.uri} target="_blank" rel="noopener noreferrer" className="underline hover:text-ink">{i ? ", " : ""}{x.title}</a>
+                        ))}
+                      </p>
+                    )}
+                  </div>
+                )}
                 <dl className="mt-3 grid grid-cols-3 gap-2 text-xs">
                   <div><dt className="text-dim">Stop loss</dt><dd className="text-down">{fmt(ai.stop_loss, idr)}</dd></div>
                   <div><dt className="text-dim">Take profit</dt><dd className="text-up">{fmt(ai.take_profit, idr)}</dd></div>
