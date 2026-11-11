@@ -524,135 +524,83 @@ Balas HANYA JSON valid tanpa markdown dengan kunci:
     for model in GEMINI_MODELS:
         try:
             resp = client.models.generate_content(
-                model=model, contents=proi(closes, period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-    d = np.diff(np.asarray(closes, dtype=float))
-    up, dn = np.clip(d, 0, None), np.clip(-d, 0, None)
-    au, ad = up[:period].mean(), dn[:period].mean()
-    for i in range(period, len(d)):
-        au = (au * (period - 1) + up[i]) / period
-        ad = (ad * (period - 1) + dn[i]) / period
-    return 100.0 if ad == 0 else round(float(100 - 100 / (1 + au / ad)), 2)
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]),
+            )
+            raw = parse_json_text(resp.text)
+            sentiment = str(raw.get("sentiment", "NEUTRAL")).upper()
+            if sentiment not in ("BULLISH", "BEARISH", "NEUTRAL"):
+                sentiment = "NEUTRAL"
+            data = {
+                "sentiment": sentiment,
+                "score": max(-1.0, min(1.0, float(raw.get("score", 0)))),
+                "confidence": max(0.0, min(100.0, float(raw.get("confidence", 0)))),
+                "risk_event": bool(raw.get("risk_event", False)),
+                "summary": str(raw.get("summary", ""))[:400],
+                "headlines": [
+                    {"title": str(h.get("title", ""))[:120], "source": str(h.get("source", ""))[:40]}
+                    for h in (raw.get("headlines") or [])[:4] if isinstance(h, dict)
+                ],
+                "sources": _grounding_sources(resp),
+            }
+            _news_cache[label] = (time.time(), data)
+            return data
+        except Exception as e:
+            print(f"Gemini berita {model} gagal: {e}")
+    return None
 
 
-def calc_macd_hist(closes):
-    if len(closes) < 40:
-        return None
-    line = ema_series(closes, 12) - ema_series(closes, 26)
-    valid = line[~np.isnan(line)]
-    signal = ema_series(valid, 9)
-    return None if np.isnan(signal[-1]) else sig(float(valid[-1] - signal[-1]))
-
-
-def calc_bollinger(closes, period: int = 20, k: float = 2.0):
-    if len(closes) < period:
-        return None
-    w = np.asarray(closes[-period:], dtype=float)
-    mid, sd = w.mean(), w.std()
-    return sig(float(mid + k * sd)), sig(float(mid)), sig(float(mid - k * sd))
-
-
-def calc_atr(klines, period: int = 14):
-    if len(klines) <= period:
-        return None
-    tr = [klines[0]["high"] - klines[0]["low"]]
-    for i in range(1, len(klines)):
-        h, l, pc = klines[i]["high"], klines[i]["low"], klines[i - 1]["close"]
-        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
-    atr = float(np.mean(tr[1 : period + 1]))
-    for x in tr[period + 1 :]:
-        atr = (atr * (period - 1) + x) / period
-    return sig(atr)
-
-
-# ---------------------------------------------------------------------- AI
-def fallback_ai(msg: str) -> dict:
-    return {"action": "HOLD", "confidence": 50, "reasoning": msg, "stop_loss": 0, "take_profit": 0}
-
-
-def sanitize_ai(raw: dict, price: float, atr) -> dict:
-    """Pastikan keluaran AI aman dipakai frontend dan stop loss / take profit masuk akal."""
-    action = str(raw.get("action", "HOLD")).upper()
-    if action not in ("BUY", "SELL", "HOLD"):
-        action = "HOLD"
-    try:
-        confidence = int(max(0, min(100, float(raw.get("confidence", 50)))))
-    except (TypeError, ValueError):
-        confidence = 50
-    try:
-        sl, tp = float(raw.get("stop_loss", 0)), float(raw.get("take_profit", 0))
-    except (TypeError, ValueError):
-        sl = tp = 0.0
-
-    if action == "HOLD":
-        sl = tp = 0.0
-    else:
-        ok = (sl < price < tp) if action == "BUY" else (tp < price < sl)
-        if not ok:  # angka AI tidak masuk akal, hitung dari ATR (risk:reward 1:2)
-            unit = atr if atr else price * 0.01
-            sign = 1 if action == "BUY" else -1
-            sl, tp = price - sign * 1.5 * unit, price + sign * 3 * unit
-    return {
-        "action": action,
-        "confidence": confidence,
-        "reasoning": str(raw.get("reasoning", ""))[:600],
-        "entry_price": sig(price),
-        "stop_loss": sig(sl) if sl else 0,
-        "take_profit": sig(tp) if tp else 0,
+def combine_signals(tech: dict, news, engine: str) -> dict:
+    """Gabungkan teknikal dan berita dengan aturan yang bisa dibaca dan dicek."""
+    out = dict(tech)
+    notes = []
+    d = {"BUY": 1, "SELL": -1}.get(out["action"], 0)
+    if d and news:
+        agree = d * news["score"] * news["confidence"] / 100
+        if agree <= -0.5:
+            out.update(action="HOLD", confidence=50, stop_loss=0, take_profit=0)
+            notes.append("Berita berlawanan kuat dengan sinyal teknikal, aksi diubah menjadi Tahan.")
+        elif agree < -0.2:
+            out["confidence"] -= 15
+            notes.append("Berita berlawanan dengan sinyal teknikal, keyakinan turun 15.")
+        elif agree > 0.3:
+            out["confidence"] += 5
+            notes.append("Berita searah dengan sinyal teknikal, keyakinan naik 5.")
+        if news["risk_event"] and out["action"] != "HOLD":
+            out["confidence"] -= 15
+            notes.append("Ada peristiwa berisiko tinggi dalam 24 jam, keyakinan turun 15.")
+    elif d and not news:
+        notes.append("Data berita tidak tersedia, sinyal ini murni teknikal.")
+    out["confidence"] = int(max(0, min(95, out["confidence"])))
+    out["components"] = {
+        "technical": {"engine": engine, "action": tech["action"], "confidence": tech["confidence"], "reasoning": tech["reasoning"]},
+        "news": ({"available": True, **news} if news else {"available": False}),
+        "adjustments": notes,
     }
+    return out
 
 
-def call_gemini_ai(m: dict, atr):
-    """Mengembalikan (hasil, berhasil). Hasil gagal tidak boleh di-cache."""
-    if not client:
-        return fallback_ai("GEMINI_API_KEY belum dipasang atau salah di file .env"), False
-
-    prompt = f"""Kamu analis teknikal. Analisa data pasar berikut dan beri rekomendasi singkat.
-
-Aset: {m['symbol']}  Timeframe: {m['interval']}  Jumlah candle: {m['candles']}
-Harga sekarang: {m['current_price']}
-RSI (14): {m['rsi_14']}
-MACD histogram: {m['macd_hist']}
-EMA 50: {m['ema_50']}
-EMA 200: {m['ema_200'] if m['ema_200'] is not None else 'tidak tersedia (data kurang)'}
-Bollinger (atas, tengah, bawah): {m['bollinger']}
-ATR (14): {m['atr_14']}
-Support / resistance 50 candle: {m['support']} / {m['resistance']}
-Tren: {m['trend']} (dasar: {m['trend_basis']})
-
-Aturan jawaban:
-- Balas HANYA JSON valid tanpa markdown, dengan kunci: action, confidence, reasoning, stop_loss, take_profit.
-- action: "BUY", "SELL", atau "HOLD". confidence: angka 0 sampai 100.
-- reasoning: maksimal 2 kalimat Bahasa Indonesia, sebut indikator yang mendasari.
-- stop_loss dan take_profit: harga absolut. BUY berarti stop_loss di bawah harga dan take_profit di atas. SELL kebalikannya. Isi 0 kalau HOLD.
-- Kalau sinyal saling bertentangan, pilih HOLD dan turunkan confidence."""
-
-    for model in GEMINI_MODELS:
-        for attempt in range(2):
-            try:
-                resp = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json"),
-                )
-                text = resp.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-                return sanitize_ai(json.loads(text), m["current_price"], atr), True
-            except Exception as e:
-                msg = str(e)
-                print(f"Model {model} (percobaan {attempt + 1}) gagal: {msg}")
-                busy = any(s in msg for s in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
-                if busy and attempt == 0:
-                    time.sleep(1.5)
-                    continue
-                break
-    return fallback_ai("Server AI sedang sibuk atau model tidak tersedia. Tekan Analisis ulang beberapa saat lagi."), False
+def run_ai(m: dict, atr):
+    """Teknikal dan berita dijalankan bersamaan. Mengembalikan (hasil, berhasil)."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_tech = ex.submit(technical_signal, m, atr)
+        f_news = ex.submit(call_gemini_news, m["symbol"])
+        tech, engine = f_tech.result()
+        try:
+            news = f_news.result()
+        except Exception as e:
+            print(f"Berita gagal: {e}")
+            news = None
+    if tech is None:
+        return fallback_ai("Mesin analisis tidak tersedia. Periksa DEEPSEEK_API_KEY atau GEMINI_API_KEY, atau coba lagi sebentar."), False
+    return combine_signals(tech, news, engine), True
 
 
 # ---------------------------------------------------------------- endpoint
 @app.get("/")
 def root():
-    return {"status": "ONLINE", "system": "Si Paling Trading Engine", "version": "4.0.0", "ai_ready": client is not None}
+    return {"status": "ONLINE", "system": "Si Paling Trading Engine", "version": "4.1.0", "ai_ready": client is not None or bool(DEEPSEEK_API_KEY),
+            "engines": {"technical": "deepseek" if DEEPSEEK_API_KEY else ("gemini" if client else "none"), "news": client is not None}}
 
 
 STABLECOINS = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD", "USDE", "USD1", "XUSD", "PYUSD",
@@ -772,7 +720,7 @@ def analyze_market(response: Response, symbol: str = "BTCUSDT", interval: str = 
         "trend_basis": basis,
     }
 
-    ai, ok = call_gemini_ai(market, atr)
+    ai, ok = run_ai(market, atr)
     payload = {"market_data": market, "ai_analysis": ai}
 
     if ok:  # jangan simpan pesan error AI selama 5 menit
