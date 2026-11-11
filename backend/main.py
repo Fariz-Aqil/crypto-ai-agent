@@ -508,14 +508,20 @@ def _grounding_sources(resp) -> list:
     return out
 
 
+def _short_error(e: Exception) -> str:
+    msg = re.sub(r"AIza[0-9A-Za-z_\-]{20,}", "[kunci]", f"{type(e).__name__}: {e}")
+    return " ".join(msg.split())[:200]
+
+
 def call_gemini_news(sym: str):
-    """Berita dan sentimen terkini lewat Gemini dengan Google Search. None kalau tidak tersedia."""
+    """Berita dan sentimen terkini lewat Gemini dengan Google Search. Mengembalikan (data, pesan_error)."""
     if not client:
-        return None
+        return None, "GEMINI_API_KEY belum dipasang atau salah"
     label = asset_label(sym)
     hit = _news_cache.get(label)
     if hit and time.time() - hit[0] < NEWS_CACHE_SECONDS:
-        return hit[1]
+        return hit[1], None
+    last_err = "Gemini tidak memberi jawaban"
     kind = "forex dan komoditas" if sym in FOREX_SYMBOLS else "kripto"
     prompt = f"""Hari ini {time.strftime('%Y-%m-%d')}. Gunakan pencarian Google untuk menemukan berita 48 jam terakhir tentang {label} dan kondisi pasar {kind} secara umum. Perhatikan juga peristiwa makro terjadwal (rapat The Fed, CPI, data tenaga kerja AS), regulasi, peretasan exchange, dan aliran dana ETF.
 Nilai sentimen berita untuk harga {label} dalam jangka pendek. Hanya berdasarkan hasil pencarian, jangan mengarang. Kalau tidak ada berita relevan, beri NEUTRAL dengan confidence rendah.
@@ -544,13 +550,14 @@ Balas HANYA JSON valid tanpa markdown dengan kunci:
                 "sources": _grounding_sources(resp),
             }
             _news_cache[label] = (time.time(), data)
-            return data
+            return data, None
         except Exception as e:
+            last_err = f"{model}: {_short_error(e)}"
             print(f"Gemini berita {model} gagal: {e}")
-    return None
+    return None, last_err
 
 
-def combine_signals(tech: dict, news, engine: str) -> dict:
+def combine_signals(tech: dict, news, engine: str, news_err=None) -> dict:
     """Gabungkan teknikal dan berita dengan aturan yang bisa dibaca dan dicek."""
     out = dict(tech)
     notes = []
@@ -574,7 +581,7 @@ def combine_signals(tech: dict, news, engine: str) -> dict:
     out["confidence"] = int(max(0, min(95, out["confidence"])))
     out["components"] = {
         "technical": {"engine": engine, "action": tech["action"], "confidence": tech["confidence"], "reasoning": tech["reasoning"]},
-        "news": ({"available": True, **news} if news else {"available": False}),
+        "news": ({"available": True, **news} if news else {"available": False, "reason": news_err or "tidak diketahui"}),
         "adjustments": notes,
     }
     return out
@@ -587,13 +594,13 @@ def run_ai(m: dict, atr):
         f_news = ex.submit(call_gemini_news, m["symbol"])
         tech, engine = f_tech.result()
         try:
-            news = f_news.result()
+            news, news_err = f_news.result()
         except Exception as e:
             print(f"Berita gagal: {e}")
-            news = None
+            news, news_err = None, _short_error(e)
     if tech is None:
         return fallback_ai("Mesin analisis tidak tersedia. Periksa DEEPSEEK_API_KEY atau GEMINI_API_KEY, atau coba lagi sebentar."), False
-    return combine_signals(tech, news, engine), True
+    return combine_signals(tech, news, engine, news_err), True
 
 
 # ---------------------------------------------------------------- endpoint
