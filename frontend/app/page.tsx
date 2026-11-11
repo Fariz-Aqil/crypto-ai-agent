@@ -312,7 +312,7 @@ export default function Home() {
                       </span>
                     </p>
                     <p className="mt-1 flex justify-between">
-                      <span className="text-dim">Berita dan sentimen</span>
+                      <span className="text-dim">Berita dan sentimen{ai.components.news.method === "rss" ? " (RSS)" : ""}</span>
                       {ai.components.news.available ? (
                         <span className={ai.components.news.sentiment === "BULLISH" ? "text-up" : ai.components.news.sentiment === "BEARISH" ? "text-down" : "text-dim"}>
                           {ai.components.news.sentiment === "BULLISH" ? "Positif" : ai.components.news.sentiment === "BEARISH" ? "Negatif" : "Netral"} ({Math.round(ai.components.news.confidence)}%)
