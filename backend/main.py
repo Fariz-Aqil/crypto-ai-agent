@@ -7,11 +7,22 @@ Variabel di file .env (semua opsional kecuali GEMINI_API_KEY kalau mau sinyal AI
   CORS_ORIGINS          tambahan origin frontend, dipisah koma (localhost sudah otomatis)
   USD_IDR_RATE          kurs untuk menghitung harga dalam rupiah (default 16200)
   ALLOW_SYNTHETIC_DATA  isi 1 untuk memakai data acak saat semua sumber data gagal (hanya untuk demo)
+  DEEPSEEK_API_KEY      kunci DeepSeek untuk analisis teknikal (kalau kosong, Gemini yang menggantikan)
+  DEEPSEEK_MODEL        nama model DeepSeek (default deepseek-flash)
+  DEEPSEEK_BASE_URL     default https://api.deepseek.com
+  DEEPSEEK_THINKING     isi 1 untuk mode berpikir (lebih teliti tapi lebih lambat)
+
+Pembagian peran AI:
+  DeepSeek -> analisis teknikal dari angka indikator (tanpa akses internet)
+  Gemini + Google Search -> berita dan sentimen terkini
+  Keduanya digabung dengan aturan yang transparan di fungsi combine_signals().
 """
 import json
 import os
 import random
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import requests
@@ -33,6 +44,11 @@ GEMINI_MODELS = [
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 USD_IDR_RATE = float(os.getenv("USD_IDR_RATE", "16200"))
 ALLOW_SYNTHETIC = os.getenv("ALLOW_SYNTHETIC_DATA", "0") == "1"
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "0") == "1"
+NEWS_CACHE_SECONDS = 900
 
 ANALYSIS_CACHE_SECONDS = 300
 KLINE_CACHE_SECONDS = 3
@@ -61,6 +77,7 @@ app.add_middleware(
 )
 
 _analysis_cache: dict = {}
+_news_cache: dict = {}
 _kline_cache: dict = {}
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
@@ -293,6 +310,221 @@ def calc_ema(closes, period: int):
 
 
 def calc_rsi(closes, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    d = np.diff(np.asarray(closes, dtype=float))
+    up, dn = np.clip(d, 0, None), np.clip(-d, 0, None)
+    au, ad = up[:period].mean(), dn[:period].mean()
+    for i in range(period, len(d)):
+        au = (au * (period - 1) + up[i]) / period
+        ad = (ad * (period - 1) + dn[i]) / period
+    return 100.0 if ad == 0 else round(float(100 - 100 / (1 + au / ad)), 2)
+
+
+def calc_macd_hist(closes):
+    if len(closes) < 40:
+        return None
+    line = ema_series(closes, 12) - ema_series(closes, 26)
+    valid = line[~np.isnan(line)]
+    signal = ema_series(valid, 9)
+    return None if np.isnan(signal[-1]) else sig(float(valid[-1] - signal[-1]))
+
+
+def calc_bollinger(closes, period: int = 20, k: float = 2.0):
+    if len(closes) < period:
+        return None
+    w = np.asarray(closes[-period:], dtype=float)
+    mid, sd = w.mean(), w.std()
+    return sig(float(mid + k * sd)), sig(float(mid)), sig(float(mid - k * sd))
+
+
+def calc_atr(klines, period: int = 14):
+    if len(klines) <= period:
+        return None
+    tr = [klines[0]["high"] - klines[0]["low"]]
+    for i in range(1, len(klines)):
+        h, l, pc = klines[i]["high"], klines[i]["low"], klines[i - 1]["close"]
+        tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+    atr = float(np.mean(tr[1 : period + 1]))
+    for x in tr[period + 1 :]:
+        atr = (atr * (period - 1) + x) / period
+    return sig(atr)
+
+
+# ---------------------------------------------------------------------- AI
+def fallback_ai(msg: str) -> dict:
+    return {"action": "HOLD", "confidence": 50, "reasoning": msg, "stop_loss": 0, "take_profit": 0}
+
+
+def sanitize_ai(raw: dict, price: float, atr) -> dict:
+    """Pastikan keluaran AI aman dipakai frontend dan stop loss / take profit masuk akal."""
+    action = str(raw.get("action", "HOLD")).upper()
+    if action not in ("BUY", "SELL", "HOLD"):
+        action = "HOLD"
+    try:
+        confidence = int(max(0, min(100, float(raw.get("confidence", 50)))))
+    except (TypeError, ValueError):
+        confidence = 50
+    try:
+        sl, tp = float(raw.get("stop_loss", 0)), float(raw.get("take_profit", 0))
+    except (TypeError, ValueError):
+        sl = tp = 0.0
+
+    if action == "HOLD":
+        sl = tp = 0.0
+    else:
+        ok = (sl < price < tp) if action == "BUY" else (tp < price < sl)
+        if not ok:  # angka AI tidak masuk akal, hitung dari ATR (risk:reward 1:2)
+            unit = atr if atr else price * 0.01
+            sign = 1 if action == "BUY" else -1
+            sl, tp = price - sign * 1.5 * unit, price + sign * 3 * unit
+    return {
+        "action": action,
+        "confidence": confidence,
+        "reasoning": str(raw.get("reasoning", ""))[:600],
+        "entry_price": sig(price),
+        "stop_loss": sig(sl) if sl else 0,
+        "take_profit": sig(tp) if tp else 0,
+    }
+
+
+def parse_json_text(text: str) -> dict:
+    t = (text or "").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", t, re.DOTALL)
+        if not m:
+            raise
+        return json.loads(m.group(0))
+
+
+def build_tech_prompt(m: dict) -> str:
+    return f"""Analisa data pasar berikut dan beri rekomendasi singkat.
+
+Aset: {m['symbol']}  Timeframe: {m['interval']}  Jumlah candle: {m['candles']}
+Harga sekarang: {m['current_price']}
+RSI (14): {m['rsi_14']}
+MACD histogram: {m['macd_hist']}
+EMA 50: {m['ema_50']}
+EMA 200: {m['ema_200'] if m['ema_200'] is not None else 'tidak tersedia (data kurang)'}
+Bollinger (atas, tengah, bawah): {m['bollinger']}
+ATR (14): {m['atr_14']}
+Support / resistance 50 candle: {m['support']} / {m['resistance']}
+Tren: {m['trend']} (dasar: {m['trend_basis']})
+
+Aturan jawaban:
+- Balas HANYA JSON valid tanpa markdown, dengan kunci: action, confidence, reasoning, stop_loss, take_profit.
+- action: "BUY", "SELL", atau "HOLD". confidence: angka 0 sampai 100.
+- reasoning: maksimal 2 kalimat Bahasa Indonesia, sebut indikator yang mendasari.
+- stop_loss dan take_profit: harga absolut. BUY berarti stop_loss di bawah harga dan take_profit di atas. SELL kebalikannya. Isi 0 kalau HOLD.
+- Kalau sinyal saling bertentangan, pilih HOLD dan turunkan confidence."""
+
+
+DEEPSEEK_SYSTEM = (
+    "Kamu analis kuantitatif yang disiplin. Kamu hanya menilai angka yang diberikan "
+    "(indikator, level harga, volatilitas) dan tidak mengarang berita. Selalu balas JSON valid."
+)
+
+
+def call_deepseek_technical(m: dict, atr):
+    if not DEEPSEEK_API_KEY:
+        return None
+    body = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [{"role": "system", "content": DEEPSEEK_SYSTEM}, {"role": "user", "content": build_tech_prompt(m)}],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 1200,
+        "thinking": {"type": "enabled" if DEEPSEEK_THINKING else "disabled"},
+    }
+    if not DEEPSEEK_THINKING:
+        body["temperature"] = 0.2
+    for attempt in range(2):
+        try:
+            res = HTTP.post(f"{DEEPSEEK_BASE_URL}/chat/completions", headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}, json=body, timeout=30)
+            if res.status_code == 400 and "thinking" in body and "thinking" in res.text:
+                body.pop("thinking")  # model lama tidak mengenal parameter ini
+                continue
+            if res.status_code in (429, 500, 502, 503) and attempt == 0:
+                time.sleep(1.5)
+                continue
+            res.raise_for_status()
+            text = res.json()["choices"][0]["message"]["content"]
+            return sanitize_ai(parse_json_text(text), m["current_price"], atr)
+        except Exception as e:
+            print(f"DeepSeek gagal (percobaan {attempt + 1}): {e}")
+    return None
+
+
+def call_gemini_technical(m: dict, atr):
+    if not client:
+        return None
+    prompt = build_tech_prompt(m)
+    for model in GEMINI_MODELS:
+        for attempt in range(2):
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                return sanitize_ai(parse_json_text(resp.text), m["current_price"], atr)
+            except Exception as e:
+                msg = str(e)
+                print(f"Gemini {model} (percobaan {attempt + 1}) gagal: {msg}")
+                if any(x in msg for x in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED")) and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                break
+    return None
+
+
+def technical_signal(m: dict, atr):
+    """DeepSeek lebih dulu. Kalau tidak tersedia atau gagal, Gemini menggantikan."""
+    sig_ds = call_deepseek_technical(m, atr)
+    if sig_ds:
+        return sig_ds, "deepseek"
+    sig_gm = call_gemini_technical(m, atr)
+    return (sig_gm, "gemini") if sig_gm else (None, "none")
+
+
+def asset_label(sym: str) -> str:
+    names = {"XAUUSD": "Emas (XAU/USD)", "XAGUSD": "Perak (XAG/USD)"}
+    if sym in names:
+        return names[sym]
+    if sym in FOREX_SYMBOLS:
+        return f"{sym[:3]}/{sym[3:]}"
+    return sym[:-4] if sym.endswith("USDT") else sym
+
+
+def _grounding_sources(resp) -> list:
+    out = []
+    try:
+        for ch in (resp.candidates[0].grounding_metadata.grounding_chunks or [])[:4]:
+            web = getattr(ch, "web", None)
+            if web and getattr(web, "uri", None):
+                out.append({"title": (web.title or web.uri)[:80], "uri": web.uri})
+    except Exception:
+        pass
+    return out
+
+
+def call_gemini_news(sym: str):
+    """Berita dan sentimen terkini lewat Gemini dengan Google Search. None kalau tidak tersedia."""
+    if not client:
+        return None
+    label = asset_label(sym)
+    hit = _news_cache.get(label)
+    if hit and time.time() - hit[0] < NEWS_CACHE_SECONDS:
+        return hit[1]
+    kind = "forex dan komoditas" if sym in FOREX_SYMBOLS else "kripto"
+    prompt = f"""Hari ini {time.strftime('%Y-%m-%d')}. Gunakan pencarian Google untuk menemukan berita 48 jam terakhir tentang {label} dan kondisi pasar {kind} secara umum. Perhatikan juga peristiwa makro terjadwal (rapat The Fed, CPI, data tenaga kerja AS), regulasi, peretasan exchange, dan aliran dana ETF.
+Nilai sentimen berita untuk harga {label} dalam jangka pendek. Hanya berdasarkan hasil pencarian, jangan mengarang. Kalau tidak ada berita relevan, beri NEUTRAL dengan confidence rendah.
+Balas HANYA JSON valid tanpa markdown dengan kunci:
+{{"sentiment": "BULLISH" atau "BEARISH" atau "NEUTRAL", "score": angka -1.0 sampai 1.0, "confidence": angka 0 sampai 100, "risk_event": true bila ada peristiwa besar dalam 24 jam yang bisa membuat harga bergejolak ekstrem, selain itu false, "summary": "maksimal 2 kalimat Bahasa Indonesia", "headlines": [{{"title": "judul singkat", "source": "nama media"}}]}}"""
+    for model in GEMINI_MODELS:
+        try:
+            resp = client.models.generate_content(
+                model=model, contents=proi(closes, period: int = 14) -> float:
     if len(closes) < period + 1:
         return 50.0
     d = np.diff(np.asarray(closes, dtype=float))
