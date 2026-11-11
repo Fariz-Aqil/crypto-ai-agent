@@ -319,6 +319,9 @@ export default function Home() {
                         </span>
                       ) : <span className="text-dim">tidak tersedia</span>}
                     </p>
+                    {!ai.components.news.available && ai.components.news.reason && (
+                      <p className="mt-1 break-words text-dim">Penyebab: {ai.components.news.reason}</p>
+                    )}
                     {ai.components.news.available && ai.components.news.summary && <p className="mt-2 leading-relaxed text-dim">{ai.components.news.summary}</p>}
                     {ai.components.adjustments?.map((n: string) => <p key={n} className="mt-1 text-hold">{n}</p>)}
                     {ai.components.news.available && ai.components.news.sources?.length > 0 && (
